@@ -1,15 +1,12 @@
 #include "vk_10.h"
+#include "ngf-common/macros.h"
 
 #define TO_STRING(str) #str
 #define STRINGIFY(str) TO_STRING(str)
 
 #if defined(_WIN32) || defined(_WIN64)
-#define ModuleHandle HMODULE
 #define VK_LOADER_LIB "vulkan-1.dll"
 #else
-#define LoadLibraryA(name) dlopen(name, RTLD_NOW)
-#define GetProcAddress(h, n) dlsym(h, n)
-#define ModuleHandle void*
 #if defined(__APPLE__)
 #define VK_LOADER_LIB "libMoltenVK.dylib"
 #else
@@ -171,6 +168,7 @@ PFN_vkGetSwapchainImagesKHR vkGetSwapchainImagesKHR;
 PFN_vkAcquireNextImageKHR vkAcquireNextImageKHR;
 PFN_vkQueuePresentKHR vkQueuePresentKHR;
 PFN_vkGetPhysicalDeviceFeatures2KHR vkGetPhysicalDeviceFeatures2KHR;
+PFN_vkDestroyDebugUtilsMessengerEXT    vkDestroyDebugUtilsMessengerEXT;
 
 bool vkl_init_loader(void) {
   ModuleHandle vkdll = LoadLibraryA(VK_LOADER_LIB);
@@ -223,6 +221,9 @@ void vkl_init_instance(VkInstance inst) {
   vkGetPhysicalDeviceSurfaceFormatsKHR = (PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceSurfaceFormatsKHR");
   vkGetPhysicalDeviceSurfaceCapabilitiesKHR = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
   vkGetPhysicalDeviceFeatures2KHR = (PFN_vkGetPhysicalDeviceFeatures2KHR)vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceFeatures2KHR");
+  vkDestroyDebugUtilsMessengerEXT = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+      inst,
+      "vkDestroyDebugUtilsMessengerEXT");
 }
 
 void vkl_init_device(VkDevice dev) {

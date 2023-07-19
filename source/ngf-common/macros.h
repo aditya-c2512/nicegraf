@@ -14,9 +14,17 @@ typedef CRITICAL_SECTION pthread_mutex_t;
 #define pthread_mutex_unlock(m)  (LeaveCriticalSection(m), 0)
 #define pthread_mutex_init(m, a) (InitializeCriticalSection(m), 0)
 #define pthread_mutex_destroy(m) (DeleteCriticalSection(m), 0)
+// dynamic module loading
+#define ModuleHandle HMODULE
 #else
 #define NGFI_THREADLOCAL __thread
 #include <pthread.h>
+#if !defined(__APPLE__)
+// dynamic module loading (emulate win32 api)
+#define LoadLibraryA(name) dlopen(name, RTLD_NOW)
+#define GetProcAddress(h, n) dlsym(h, n)
+#define ModuleHandle void*
+#endif
 #endif
 
 #ifdef __cplusplus

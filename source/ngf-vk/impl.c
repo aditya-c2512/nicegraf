@@ -31,6 +31,7 @@
 #include "vk_10.h"
 
 #include <assert.h>
+#include <renderdoc_app.h>
 #include <spirv_reflect.h>
 #include <string.h>
 #include <vk_mem_alloc.h>
@@ -43,9 +44,9 @@
 #define NGFVK_MAX_COLOR_ATTACHMENTS            16u
 #define NGFVK_IMAGE_USAGE_TRANSIENT_ATTACHMENT (1u << 31u)
 
-#define NGFVK_GFX_PIPELINE_STAGE_MASK                                                          \
-  (VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |                  \
-   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |        \
+#define NGFVK_GFX_PIPELINE_STAGE_MASK                                                   \
+  (VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |           \
+   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | \
    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
 
 #pragma endregion
@@ -55,13 +56,17 @@
 // Singleton for holding vulkan instance, device and queue handles.
 // This is shared by all contexts.
 struct {
-  VkInstance       instance;
-  VkPhysicalDevice phys_dev;
-  VkDevice         device;
-  VkQueue          gfx_queue;
-  VkQueue          present_queue;
-  uint32_t         gfx_family_idx;
-  uint32_t         present_family_idx;
+  VkInstance               instance;
+  VkPhysicalDevice         phys_dev;
+  VkDevice                 device;
+  VkQueue                  gfx_queue;
+  VkQueue                  present_queue;
+  uint32_t                 gfx_family_idx;
+  uint32_t                 present_family_idx;
+  VkExtensionProperties*   supported_phys_dev_exts;
+  uint32_t                 nsupported_phys_dev_exts;
+  bool                     validation_enabled;
+  VkDebugUtilsMessengerEXT debug_messenger;
 #if defined(__linux__)
   xcb_connection_t* xcb_connection;
   xcb_visualid_t    xcb_visualid;
@@ -248,6 +253,12 @@ typedef struct ngf_image_t {
   uint32_t       nlevels;
   uint32_t       nlayers;
 } ngf_image_t;
+
+// Singleton class for holding on to RenderDoc API
+struct {
+  RENDERDOC_API_1_6_0* api;
+  bool                 is_capturing_next_frame;
+} _renderdoc;
 
 typedef struct ngf_context_t {
   ngfvk_frame_resources*      frame_res;
@@ -741,8 +752,7 @@ static VkPipelineStageFlags get_vk_buffer_pipeline_stage_flags(ngf_buffer buf) {
     result |=
         (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-  if (buf->usage_flags & NGF_BUFFER_USAGE_XFER_DST ||
-      buf->usage_flags & NGF_BUFFER_USAGE_XFER_SRC)
+  if (buf->usage_flags & NGF_BUFFER_USAGE_XFER_DST || buf->usage_flags & NGF_BUFFER_USAGE_XFER_SRC)
     result |= VK_PIPELINE_STAGE_TRANSFER_BIT;
   return result;
 }
@@ -751,7 +761,8 @@ static VkPipelineStageFlags get_vk_buffer_pipeline_stage_flags(ngf_buffer buf) {
 
 #pragma region internal_funcs
 
-void ngfi_set_allocation_callbacks(const ngf_allocation_callbacks* callbacks);
+void             ngfi_set_allocation_callbacks(const ngf_allocation_callbacks* callbacks);
+ngf_sample_count ngfi_get_highest_sample_count(size_t counts_bitmap);
 
 // Handler for messages from validation layers, etc.
 // All messages are forwarded to the user-provided debug callback.
@@ -1237,8 +1248,6 @@ static void ngfvk_retire_resources(ngfvk_frame_resources* frame_res) {
     NGFI_DARRAY_APPEND(frame_res->real_retire_events, NGFI_DARRAY_AT(frame_res->retire_events, s));
   }
 
-
-
   NGFI_DARRAY_FOREACH(frame_res->retire_buffers, a) {
     ngfvk_alloc* b = &(NGFI_DARRAY_AT(frame_res->retire_buffers, a));
     vmaDestroyBuffer(b->parent_allocator, (VkBuffer)b->obj_handle, b->vma_alloc);
@@ -1304,8 +1313,9 @@ static ngf_error ngfvk_encoder_start(ngf_cmd_buffer cmd_buf) {
   return NGF_ERROR_OK;
 }
 
-static ngf_error ngfvk_initialize_generic_encoder(ngf_cmd_buffer cmd_buf, struct ngfi_private_encoder_data* enc) {
-  enc->d0 = (uintptr_t)cmd_buf;
+static ngf_error
+ngfvk_initialize_generic_encoder(ngf_cmd_buffer cmd_buf, struct ngfi_private_encoder_data* enc) {
+  enc->d0                          = (uintptr_t)cmd_buf;
   const VkEventCreateInfo event_ci = {
       .sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO,
       .pNext = NULL,
@@ -1319,9 +1329,9 @@ static ngf_error ngfvk_initialize_generic_encoder(ngf_cmd_buffer cmd_buf, struct
 }
 
 static ngf_error ngfvk_encoder_end(
-    ngf_cmd_buffer       cmd_buf,
-    struct ngfi_private_encoder_data*       generic_enc,
-    VkPipelineStageFlags stage_mask) {
+    ngf_cmd_buffer                    cmd_buf,
+    struct ngfi_private_encoder_data* generic_enc,
+    VkPipelineStageFlags              stage_mask) {
   vkCmdSetEvent(cmd_buf->vk_cmd_buffer, (VkEvent)generic_enc->d1, stage_mask);
   ngfvk_cleanup_pending_binds(cmd_buf);
   const size_t fi = CURRENT_CONTEXT->frame_id;
@@ -1759,9 +1769,10 @@ static void ngfvk_execute_pending_binds(ngf_cmd_buffer cmd_buf) {
         vk_bind_info->sampler     = VK_NULL_HANDLE;
         if (bind_op->type == NGF_DESCRIPTOR_IMAGE ||
             bind_op->type == NGF_DESCRIPTOR_IMAGE_AND_SAMPLER) {
-          vk_bind_info->imageView   = bind_info->image->vkview;
+          vk_bind_info->imageView     = bind_info->image->vkview;
           const bool is_storage_image = bind_info->image->usage_flags & NGF_IMAGE_USAGE_STORAGE;
-          vk_bind_info->imageLayout = (is_storage_image) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          vk_bind_info->imageLayout   = (is_storage_image) ? VK_IMAGE_LAYOUT_GENERAL
+                                                           : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         } else if (bind_op->type == NGF_DESCRIPTOR_STORAGE_IMAGE) {
           vk_bind_info->imageView   = bind_info->image->vkview;
           vk_bind_info->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2006,7 +2017,7 @@ static VkRenderPass ngfvk_lookup_renderpass(ngf_render_target rt, uint64_t ops_k
 
   if (result == VK_NULL_HANDLE) {
     const uint32_t nattachments               = rt->nattachments;
-    const size_t attachment_pass_descs_size = sizeof(ngfvk_attachment_pass_desc) * nattachments;
+    const size_t   attachment_pass_descs_size = sizeof(ngfvk_attachment_pass_desc) * nattachments;
     ngfvk_attachment_pass_desc* attachment_compat_pass_descs =
         ngfi_sa_alloc(ngfi_tmp_store(), attachment_pass_descs_size);
     const size_t rt_attachment_pass_descs_size =
@@ -2077,7 +2088,7 @@ static void ngfvk_init_loader_if_necessary() {
     NGFI_DIAG_INFO("Initializing Vulkan loader.")
     if (!vkl_init_loader()) {
       // Initialize the vulkan loader if it wasn't initialized before.
-      NGFI_DIAG_ERROR("Failed to initialize Vulkan loader.")    
+      NGFI_DIAG_ERROR("Failed to initialize Vulkan loader.")
     }
     NGFI_DIAG_INFO("Vulkan loader initialized successfully.");
   }
@@ -2120,13 +2131,13 @@ ngfvk_create_instance(bool request_validation, VkInstance* instance_ptr, bool* v
 
   // Create a Vulkan instance.
   const VkInstanceCreateInfo inst_info = {
-      .sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-      .pNext                   = NULL,
-      .flags                   = 0u,
-      .pApplicationInfo        = &app_info,
-      .enabledLayerCount       = enable_validation ? 1u : 0u,
-      .ppEnabledLayerNames     = enabled_layers,
-      .enabledExtensionCount   = (uint32_t)NGFI_ARRAYSIZE(ext_names) - (enable_validation ? 0u : 1u),
+      .sType                 = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+      .pNext                 = NULL,
+      .flags                 = 0u,
+      .pApplicationInfo      = &app_info,
+      .enabledLayerCount     = enable_validation ? 1u : 0u,
+      .ppEnabledLayerNames   = enabled_layers,
+      .enabledExtensionCount = (uint32_t)NGFI_ARRAYSIZE(ext_names) - (enable_validation ? 0u : 1u),
       .ppEnabledExtensionNames = ext_names};
   VkResult vk_err = vkCreateInstance(&inst_info, NULL, instance_ptr);
   if (vk_err != VK_SUCCESS) {
@@ -2384,14 +2395,14 @@ struct ngfvk_wait_events_params {
 
 union ngfvk_sync_resources {
   const ngf_sync_compute_resource* sync_compute_resources;
-  const ngf_sync_render_resource* sync_render_resources;
+  const ngf_sync_render_resource*  sync_render_resources;
   const ngf_sync_xfer_resource*    sync_xfer_resources;
 };
 
 enum ngfvk_sync_encoder_type {
-    NGFVK_SYNC_COMPUTE_ENCODER,
-    NGFVK_SYNC_RENDER_ENCODER,
-    NGFVK_SYNC_XFER_ENCODER
+  NGFVK_SYNC_COMPUTE_ENCODER,
+  NGFVK_SYNC_RENDER_ENCODER,
+  NGFVK_SYNC_XFER_ENCODER
 };
 
 static void ngfvk_generate_sync_op_barriers(
@@ -2404,13 +2415,13 @@ static void ngfvk_generate_sync_op_barriers(
   if (nsync_resources <= 0u) { return; }
   for (uint32_t i = 0u; i < nsync_resources; ++i) {
     ngf_sync_resource_ref sync_resource = {
-        .resource.buffer_slice = { .buffer = NULL, .offset = 0u, .range = 0u},
+        .resource.buffer_slice = {.buffer = NULL, .offset = 0u, .range = 0u},
         .sync_resource_type    = NGF_SYNC_RESOURCE_BUFFER};
     VkEvent wait_event = VK_NULL_HANDLE;
     switch (sync_encoder_type) {
     case NGFVK_SYNC_COMPUTE_ENCODER:
       sync_resource = sync_resources.sync_compute_resources[i].resource;
-      wait_event    = (VkEvent)sync_resources.sync_compute_resources[i].encoder.pvt_data_donotuse.d1;
+      wait_event = (VkEvent)sync_resources.sync_compute_resources[i].encoder.pvt_data_donotuse.d1;
       break;
     case NGFVK_SYNC_RENDER_ENCODER:
       sync_resource = sync_resources.sync_render_resources[i].resource;
@@ -2610,6 +2621,48 @@ static ngf_error ngfvk_execute_sync_op(
   return NGF_ERROR_OK;
 }
 
+static bool ngfvk_phys_dev_extension_supported(const char* ext_name) {
+  if (_vk.supported_phys_dev_exts == NULL || _vk.nsupported_phys_dev_exts == 0) {
+    VkResult result;
+
+    result = vkEnumerateDeviceExtensionProperties(
+        _vk.phys_dev,
+        NULL,
+        &_vk.nsupported_phys_dev_exts,
+        NULL);
+    if (result != VK_SUCCESS) {
+      NGFI_DIAG_WARNING("Failed to fetch physical device extensions count");
+      return false;
+    }
+
+    _vk.supported_phys_dev_exts =
+        malloc(sizeof(VkExtensionProperties) * _vk.nsupported_phys_dev_exts);
+    if (_vk.supported_phys_dev_exts == NULL) {
+      NGFI_DIAG_WARNING("Out of memory");
+      return false;
+    }
+
+    result = vkEnumerateDeviceExtensionProperties(
+        _vk.phys_dev,
+        NULL,
+        &_vk.nsupported_phys_dev_exts,
+        _vk.supported_phys_dev_exts);
+    if (result != VK_SUCCESS) {
+      NGFI_DIAG_WARNING("Failed to fetch physical device extensions");
+      return false;
+    }
+  }
+
+  uint32_t supported_exts_idx;
+  for (supported_exts_idx = 0; supported_exts_idx < _vk.nsupported_phys_dev_exts;
+       supported_exts_idx++) {
+    const VkExtensionProperties* supported_ext = &_vk.supported_phys_dev_exts[supported_exts_idx];
+    if (strcmp(ext_name, supported_ext->extensionName) == 0) { return true; }
+  }
+
+  return false;
+}
+
 #pragma endregion
 
 #pragma region external_funcs
@@ -2682,16 +2735,29 @@ ngf_error ngf_get_device_list(const ngf_device** devices, uint32_t* ndevices) {
       devcaps->max_fragment_input_components = vkdevlimits->maxFragmentInputComponents;
       devcaps->max_fragment_inputs =
           (devcaps->max_fragment_input_components) / 4; /* as per vk spec. */
-      devcaps->max_1d_image_dimension         = vkdevlimits->maxImageDimension1D;
-      devcaps->max_2d_image_dimension         = vkdevlimits->maxImageDimension2D;
-      devcaps->max_3d_image_dimension         = vkdevlimits->maxImageDimension3D;
-      devcaps->max_cube_image_dimension       = vkdevlimits->maxImageDimensionCube;
-      devcaps->max_image_layers               = vkdevlimits->maxImageArrayLayers;
-      devcaps->max_color_attachments_per_pass = vkdevlimits->maxColorAttachments;
-      devcaps->max_uniform_buffers_per_stage  = vkdevlimits->maxPerStageDescriptorUniformBuffers;
-      devcaps->max_sampler_anisotropy         = vkdevlimits->maxSamplerAnisotropy;
-      devcaps->max_uniform_buffer_range       = vkdevlimits->maxUniformBufferRange;
-      devcaps->cubemap_arrays_supported       = dev_features.imageCubeArray;
+      devcaps->max_1d_image_dimension          = vkdevlimits->maxImageDimension1D;
+      devcaps->max_2d_image_dimension          = vkdevlimits->maxImageDimension2D;
+      devcaps->max_3d_image_dimension          = vkdevlimits->maxImageDimension3D;
+      devcaps->max_cube_image_dimension        = vkdevlimits->maxImageDimensionCube;
+      devcaps->max_image_layers                = vkdevlimits->maxImageArrayLayers;
+      devcaps->max_color_attachments_per_pass  = vkdevlimits->maxColorAttachments;
+      devcaps->max_uniform_buffers_per_stage   = vkdevlimits->maxPerStageDescriptorUniformBuffers;
+      devcaps->max_sampler_anisotropy          = vkdevlimits->maxSamplerAnisotropy;
+      devcaps->max_uniform_buffer_range        = vkdevlimits->maxUniformBufferRange;
+      devcaps->cubemap_arrays_supported        = dev_features.imageCubeArray;
+      devcaps->framebuffer_color_sample_counts = vkdevlimits->framebufferColorSampleCounts;
+      devcaps->framebuffer_depth_sample_counts = vkdevlimits->framebufferDepthSampleCounts;
+      devcaps->texture_color_sample_counts     = vkdevlimits->sampledImageColorSampleCounts;
+      devcaps->texture_depth_sample_counts     = vkdevlimits->sampledImageDepthSampleCounts;
+
+      devcaps->max_supported_framebuffer_color_sample_count =
+          ngfi_get_highest_sample_count(devcaps->framebuffer_color_sample_counts);
+      devcaps->max_supported_framebuffer_depth_sample_count =
+          ngfi_get_highest_sample_count(devcaps->framebuffer_depth_sample_counts);
+      devcaps->max_supported_texture_color_sample_count =
+          ngfi_get_highest_sample_count(devcaps->texture_color_sample_counts);
+      devcaps->max_supported_texture_depth_sample_count =
+          ngfi_get_highest_sample_count(devcaps->texture_depth_sample_counts);
     }
 ngf_enumerate_devices_cleanup:
     if (tmp_instance != VK_NULL_HANDLE) { destroy_vk_instance(tmp_instance, NULL); }
@@ -2704,6 +2770,22 @@ ngf_enumerate_devices_cleanup:
 
 ngf_error ngf_initialize(const ngf_init_info* init_info) {
   assert(init_info);
+
+  if (init_info->renderdoc_info) {
+    ModuleHandle ngf_renderdoc_mod = LoadLibraryA(init_info->renderdoc_info->renderdoc_lib_path);
+    if (ngf_renderdoc_mod != NULL) {
+      pRENDERDOC_GetAPI RENDERDOC_GetAPI =
+          (pRENDERDOC_GetAPI)GetProcAddress(ngf_renderdoc_mod, "RENDERDOC_GetAPI");
+      if (!RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, (void**)&_renderdoc.api)) {
+        return NGF_ERROR_OBJECT_CREATION_FAILED;
+      }
+      if (init_info->renderdoc_info->renderdoc_destination_template) {
+        _renderdoc.api->SetCaptureFilePathTemplate(
+            init_info->renderdoc_info->renderdoc_destination_template);
+      }
+      _renderdoc.is_capturing_next_frame = false;
+    }
+  }
 
   // Sanity checks.
   if (!init_info) { return NGF_ERROR_INVALID_OPERATION; }
@@ -2730,15 +2812,14 @@ ngf_error ngf_initialize(const ngf_init_info* init_info) {
   ngfvk_init_loader_if_necessary();
 
   // Create vk instance, attempting to enable api validation according to user preference.
-  bool       validation_enabled = false;
   const bool request_validation = ngfi_diag_info.verbosity == NGF_DIAGNOSTICS_VERBOSITY_DETAILED;
-  ngfvk_create_instance(request_validation, &_vk.instance, &validation_enabled);
+  ngfvk_create_instance(request_validation, &_vk.instance, &_vk.validation_enabled);
   vkl_init_instance(
       _vk.instance);  // load instance-level Vulkan functions into the global namespace.
 
   // If validation was requested, and successfully enabled, install a debug callback to forward
   // vulkan debug messages to the user.
-  if (validation_enabled) {
+  if (_vk.validation_enabled) {
     NGFI_DIAG_INFO("vulkan validation layers enabled");
     const VkDebugUtilsMessengerCreateInfoEXT debug_callback_info = {
         .sType           = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
@@ -2754,8 +2835,7 @@ ngf_error ngf_initialize(const ngf_init_info* init_info) {
                        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
         .pfnUserCallback = ngfvk_debug_message_callback,
         .pUserData       = NULL};
-    VkDebugUtilsMessengerEXT vk_debug_messenger;
-    vkCreateDebugUtilsMessengerEXT(_vk.instance, &debug_callback_info, NULL, &vk_debug_messenger);
+    vkCreateDebugUtilsMessengerEXT(_vk.instance, &debug_callback_info, NULL, &_vk.debug_messenger);
   } else {
     NGFI_DIAG_INFO("vulkan validation is disabled");
   }
@@ -2840,6 +2920,10 @@ ngf_error ngf_initialize(const ngf_init_info* init_info) {
       "VK_KHR_maintenance1",
       "VK_KHR_swapchain",
       "VK_KHR_shader_float16_int8"};
+  const uint32_t device_exts_count = sizeof(device_exts) / sizeof(const char*);
+  const bool     shader_float16_int8_supported =
+      ngfvk_phys_dev_extension_supported("VK_KHR_shader_float16_int8");
+
   const VkBool32 enable_cubemap_arrays =
       NGFVK_DEVICE_LIST[device_idx].capabilities.cubemap_arrays_supported ? VK_TRUE : VK_FALSE;
   const VkPhysicalDeviceFeatures required_features = {
@@ -2859,15 +2943,16 @@ ngf_error ngf_initialize(const ngf_init_info* init_info) {
   }
 
   const VkDeviceCreateInfo dev_info = {
-      .sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-      .pNext                   = &sf16_features,
-      .flags                   = 0,
-      .queueCreateInfoCount    = num_queue_infos,
-      .pQueueCreateInfos       = &queue_infos[same_gfx_and_present ? 1u : 0u],
-      .enabledLayerCount       = 0,
-      .ppEnabledLayerNames     = NULL,
-      .pEnabledFeatures        = &required_features,
-      .enabledExtensionCount   = sizeof(device_exts) / sizeof(const char*),
+      .sType                = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .pNext                = &sf16_features,
+      .flags                = 0,
+      .queueCreateInfoCount = num_queue_infos,
+      .pQueueCreateInfos    = &queue_infos[same_gfx_and_present ? 1u : 0u],
+      .enabledLayerCount    = 0,
+      .ppEnabledLayerNames  = NULL,
+      .pEnabledFeatures     = &required_features,
+      .enabledExtensionCount =
+          shader_float16_int8_supported ? device_exts_count : device_exts_count - 1,
       .ppEnabledExtensionNames = device_exts};
   vk_err = vkCreateDevice(_vk.phys_dev, &dev_info, NULL, &_vk.device);
   if (vk_err != VK_SUCCESS) {
@@ -2892,6 +2977,20 @@ ngf_error ngf_initialize(const ngf_init_info* init_info) {
   // Done!
 
   return NGF_ERROR_OK;
+}
+
+void ngf_shutdown(void) {
+  NGFI_DIAG_INFO("Shutting down nicegraf.");
+
+  if (CURRENT_CONTEXT != NULL) {
+      NGFI_DIAG_ERROR("Context not destroyed before shutdown.")
+  }
+
+  vkDestroyDevice(_vk.device, NULL);
+  if (_vk.validation_enabled) {
+    vkDestroyDebugUtilsMessengerEXT(_vk.instance, _vk.debug_messenger, NULL);
+  }
+  vkDestroyInstance(_vk.instance, NULL);
 }
 
 const ngf_device_capabilities* ngf_get_device_capabilities(void) {
@@ -3189,6 +3288,13 @@ ngf_error ngf_resize_context(ngf_context ctx, uint32_t new_width, uint32_t new_h
   return err;
 }
 
+void ngfvk_reset_renderpass_cache(ngf_context ctx) {
+  NGFI_DARRAY_FOREACH(ctx->renderpass_cache, p) {
+    vkDestroyRenderPass(_vk.device, NGFI_DARRAY_AT(ctx->renderpass_cache, p).renderpass, NULL);
+  }
+  NGFI_DARRAY_CLEAR(ctx->renderpass_cache);
+}
+
 void ngf_destroy_context(ngf_context ctx) {
   if (ctx != NULL) {
     vkDeviceWaitIdle(_vk.device);
@@ -3201,6 +3307,11 @@ void ngf_destroy_context(ngf_context ctx) {
 
     for (uint32_t f = 0u; ctx->frame_res != NULL && f < ctx->max_inflight_frames; ++f) {
       ngfvk_retire_resources(&ctx->frame_res[f]);
+
+      NGFI_DARRAY_FOREACH(ctx->frame_res[f].real_retire_events, s) {
+        vkDestroyEvent(_vk.device, NGFI_DARRAY_AT(ctx->frame_res[f].real_retire_events, s), NULL);
+      }
+
       NGFI_DARRAY_DESTROY(ctx->frame_res[f].retire_pipelines);
       NGFI_DARRAY_DESTROY(ctx->frame_res[f].retire_pipeline_layouts);
       NGFI_DARRAY_DESTROY(ctx->frame_res[f].retire_dset_layouts);
@@ -3215,7 +3326,7 @@ void ngf_destroy_context(ngf_context ctx) {
       NGFI_DARRAY_DESTROY(ctx->frame_res[f].retire_buffers);
       NGFI_DARRAY_DESTROY(ctx->frame_res[f].cmd_bufs);
       NGFI_DARRAY_DESTROY(ctx->frame_res[f].cmd_pools);
-      for (uint32_t i = 0u; i < ctx->frame_res[f].nwait_fences; ++i) {
+      for (uint32_t i = 0u; i < sizeof(ctx->frame_res[f].fences) / sizeof(VkFence); ++i) {
         vkDestroyFence(_vk.device, ctx->frame_res[f].fences[i], NULL);
       }
       if (ctx->frame_res[f].semaphore != VK_NULL_HANDLE) {
@@ -3228,9 +3339,7 @@ void ngf_destroy_context(ngf_context ctx) {
     }
     NGFI_DARRAY_DESTROY(ctx->desc_superpools);
 
-    NGFI_DARRAY_FOREACH(ctx->renderpass_cache, r) {
-      vkDestroyRenderPass(_vk.device, NGFI_DARRAY_AT(ctx->renderpass_cache, r).renderpass, NULL);
-    }
+    ngfvk_reset_renderpass_cache(ctx);
     NGFI_DARRAY_DESTROY(ctx->renderpass_cache);
 
     NGFI_DARRAY_FOREACH(ctx->command_superpools, i) {
@@ -3277,16 +3386,16 @@ ngf_error ngf_create_cmd_buffer(const ngf_cmd_buffer_info* info, ngf_cmd_buffer*
 }
 
 ngf_error ngf_cmd_begin_render_pass_simple_with_sync(
-    ngf_cmd_buffer      cmd_buf,
-    ngf_render_target   rt,
-    float               clear_color_r,
-    float               clear_color_g,
-    float               clear_color_b,
-    float               clear_color_a,
-    float               clear_depth,
-    uint32_t            clear_stencil,
-    uint32_t            nsync_compute_resources,
-    const ngf_sync_compute_resource*  sync_compute_resources,
+    ngf_cmd_buffer                   cmd_buf,
+    ngf_render_target                rt,
+    float                            clear_color_r,
+    float                            clear_color_g,
+    float                            clear_color_b,
+    float                            clear_color_a,
+    float                            clear_depth,
+    uint32_t                         clear_stencil,
+    uint32_t                         nsync_compute_resources,
+    const ngf_sync_compute_resource* sync_compute_resources,
     ngf_render_encoder*              enc) {
   ngfi_sa_reset(ngfi_tmp_store());
   ngf_attachment_load_op* load_ops =
@@ -3312,10 +3421,10 @@ ngf_error ngf_cmd_begin_render_pass_simple_with_sync(
     store_ops[i]               = is_multisampled ? NGF_STORE_OP_DONTCARE : NGF_STORE_OP_STORE;
   }
   const ngf_render_pass_info pass_info = {
-      .render_target = rt,
-      .load_ops      = load_ops,
-      .store_ops     = store_ops,
-      .clears        = clears,
+      .render_target          = rt,
+      .load_ops               = load_ops,
+      .store_ops              = store_ops,
+      .clears                 = clears,
       .sync_compute_resources = {
           .nsync_resources = nsync_compute_resources,
           .sync_resources  = sync_compute_resources}};
@@ -3347,10 +3456,10 @@ ngf_error ngf_cmd_begin_render_pass_simple(
 }
 
 ngf_error ngf_cmd_begin_render_pass(
-    ngf_cmd_buffer       cmd_buf,
+    ngf_cmd_buffer              cmd_buf,
     const ngf_render_pass_info* pass_info,
-    ngf_render_encoder*  enc) {
-  ngf_error err = NGF_ERROR_OK;
+    ngf_render_encoder*         enc) {
+  ngf_error          err         = NGF_ERROR_OK;
   const VkRenderPass render_pass = ngfvk_lookup_renderpass(
       pass_info->render_target,
       ngfvk_renderpass_ops_key(
@@ -3404,8 +3513,10 @@ ngf_error ngf_cmd_begin_render_pass(
         cmd_buf,
         pass_info->sync_compute_resources.nsync_resources,
         pass_info->sync_compute_resources.sync_resources,
-        0u, NULL,
-        0u, NULL,
+        0u,
+        NULL,
+        0u,
+        NULL,
         NGFVK_GFX_PIPELINE_STAGE_MASK);
     if (err != NGF_ERROR_OK) return err;
   }
@@ -3424,15 +3535,20 @@ ngf_error ngf_cmd_begin_render_pass(
   return NGF_ERROR_OK;
 }
 
-ngf_error ngf_cmd_begin_xfer_pass(ngf_cmd_buffer cmd_buf, const ngf_xfer_pass_info* pass_info, ngf_xfer_encoder* enc) {
+ngf_error ngf_cmd_begin_xfer_pass(
+    ngf_cmd_buffer            cmd_buf,
+    const ngf_xfer_pass_info* pass_info,
+    ngf_xfer_encoder*         enc) {
   ngf_error err;
   if (pass_info->sync_compute_resources.nsync_resources > 0u) {
     err = ngfvk_execute_sync_op(
         cmd_buf,
         pass_info->sync_compute_resources.nsync_resources,
         pass_info->sync_compute_resources.sync_resources,
-        0u, NULL,
-        0u, NULL,
+        0u,
+        NULL,
+        0u,
+        NULL,
         VK_PIPELINE_STAGE_TRANSFER_BIT);
     if (err != NGF_ERROR_OK) return err;
   }
@@ -3542,6 +3658,13 @@ ngf_error ngf_submit_cmd_buffers(uint32_t nbuffers, ngf_cmd_buffer* cmd_bufs) {
 ngf_error ngf_begin_frame(ngf_frame_token* token) {
   ngf_error      err = NGF_ERROR_OK;
   const uint32_t fi  = CURRENT_CONTEXT->frame_id;
+
+  // setup frame capture
+  if (_renderdoc.api && _renderdoc.is_capturing_next_frame) {
+    _renderdoc.api->StartFrameCapture(
+        RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(_vk.instance),
+        (RENDERDOC_WindowHandle)CURRENT_CONTEXT->swapchain_info.native_handle);
+  }
 
   // reset stack allocator.
   ngfi_sa_reset(ngfi_tmp_store());
@@ -3661,6 +3784,14 @@ ngf_error ngf_end_frame(ngf_frame_token token) {
     if (present_result != VK_SUCCESS) err = NGF_ERROR_INVALID_OPERATION;
   }
 
+  // end frame capture
+  if (_renderdoc.api && _renderdoc.is_capturing_next_frame) {
+    _renderdoc.api->EndFrameCapture(
+        RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(_vk.instance),
+        (RENDERDOC_WindowHandle)CURRENT_CONTEXT->swapchain_info.native_handle);
+    _renderdoc.is_capturing_next_frame = false;
+  }
+
   return err;
 }
 
@@ -3768,10 +3899,10 @@ ngf_error ngf_create_graphics_pipeline(
 
   // Prepare input assembly.
   VkPipelineInputAssemblyStateCreateInfo input_assembly = {
-      .sType                  = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-      .pNext                  = NULL,
-      .flags                  = 0u,
-      .topology               = get_vk_primitive_type(info->input_assembly_info->primitive_topology),
+      .sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+      .pNext    = NULL,
+      .flags    = 0u,
+      .topology = get_vk_primitive_type(info->input_assembly_info->primitive_topology),
       .primitiveRestartEnable = info->input_assembly_info->enable_primitive_restart};
 
   // Prepare tessellation state.
@@ -4107,7 +4238,7 @@ ngf_error ngf_create_render_target(const ngf_render_target_info* info, ngf_rende
     const ngf_image_ref* attachment_img_ref = &info->attachment_image_refs[a];
     const ngf_image      attachment_img     = attachment_img_ref->image;
     const bool is_attachment_sampled = attachment_img->usage_flags & NGF_IMAGE_USAGE_SAMPLE_FROM;
-    const bool is_attachment_storage  = attachment_img->usage_flags & NGF_IMAGE_USAGE_STORAGE;
+    const bool is_attachment_storage = attachment_img->usage_flags & NGF_IMAGE_USAGE_STORAGE;
     attachment_pass_desc->is_resolve = false;
     attachment_pass_desc->initial_layout =
         is_attachment_storage ? VK_IMAGE_LAYOUT_GENERAL
@@ -4226,7 +4357,7 @@ void ngf_destroy_render_target(ngf_render_target target) {
     // clear out the entire renderpass cache to make sure the entries associated
     // with this target don't stick around.
     // TODO: clear out all caches across all contexts.
-    NGFI_DARRAY_CLEAR(CURRENT_CONTEXT->renderpass_cache);
+    ngfvk_reset_renderpass_cache(CURRENT_CONTEXT);
   }
 }
 
@@ -4807,8 +4938,8 @@ ngf_error ngf_create_buffer(const ngf_buffer_info* info, ngf_buffer* result) {
     buf->size = info->size;
   }
 
-  buf->storage_type   = info->storage_type;
-  buf->usage_flags = info->buffer_usage;
+  buf->storage_type = info->storage_type;
+  buf->usage_flags  = info->buffer_usage;
 
   return err;
 }
@@ -4947,11 +5078,13 @@ ngf_error ngf_create_image(const ngf_image_info* info, ngf_image* result) {
                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT |
                        VK_ACCESS_MEMORY_WRITE_BIT,
       .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
-      .newLayout           = is_storage ? VK_IMAGE_LAYOUT_GENERAL : (is_sampled_from
-                                 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                 : (is_depth_stencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                                    : is_attachment ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-                                                    : VK_IMAGE_LAYOUT_GENERAL)),
+      .newLayout           = is_storage
+                                 ? VK_IMAGE_LAYOUT_GENERAL
+                                 : (is_sampled_from
+                                        ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                        : (is_depth_stencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                           : is_attachment ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                                           : VK_IMAGE_LAYOUT_GENERAL)),
       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .image               = (VkImage)img->alloc.obj_handle,
@@ -5034,6 +5167,26 @@ void ngf_destroy_sampler(ngf_sampler sampler) {
 
 void ngf_finish(void) {
   vkDeviceWaitIdle(_vk.device);
+}
+
+void ngf_renderdoc_capture_next_frame() {
+  if (_renderdoc.api) _renderdoc.is_capturing_next_frame = true;
+}
+
+void ngf_renderdoc_capture_begin() {
+  if (_renderdoc.api && !_renderdoc.api->IsFrameCapturing()) {
+    _renderdoc.api->StartFrameCapture(
+        RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(_vk.instance),
+        (RENDERDOC_WindowHandle)CURRENT_CONTEXT->swapchain_info.native_handle);
+  }
+}
+
+void ngf_renderdoc_capture_end() {
+  if (_renderdoc.api && _renderdoc.api->IsFrameCapturing()) {
+    _renderdoc.api->EndFrameCapture(
+        RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(_vk.instance),
+        (RENDERDOC_WindowHandle)CURRENT_CONTEXT->swapchain_info.native_handle);
+  }
 }
 
 #pragma endregion
